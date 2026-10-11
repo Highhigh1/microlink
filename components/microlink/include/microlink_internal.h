@@ -198,6 +198,11 @@ typedef struct {
 #define ML_EVT_SHUTDOWN_REQUEST     BIT6
 #define ML_EVT_DERP_RECONNECT       BIT7
 #define ML_EVT_DERP_CONNECT_REQ     BIT8
+#define ML_EVT_SETDNS_DONE          BIT9
+
+#define ML_SETDNS_IDLE    0
+#define ML_SETDNS_QUEUED  1
+#define ML_SETDNS_SENT    2
 
 /* ============================================================================
  * Queue Message Types
@@ -359,6 +364,21 @@ struct microlink_s {
     /* Our own MagicDNS FQDN from the control plane (e.g. "host.tailnet.ts.net"),
      * empty until a MapResponse names us. Written only from coord. */
     char self_name[128];
+    /* First of DNSConfig.CertDomains: the name the control plane will help get
+     * a certificate for. Empty when HTTPS certificates are off in the tailnet. */
+    char cert_domain[128];
+
+    /* One set-dns request at a time (ACME DNS-01). The caller fills name/value
+     * and sets state to QUEUED; coord sends it and reports through
+     * ML_EVT_SETDNS_DONE. */
+    SemaphoreHandle_t setdns_mu;
+    volatile int setdns_state;          /* ML_SETDNS_* */
+    char setdns_name[160];
+    char setdns_value[128];
+    uint32_t setdns_sid;
+    uint64_t setdns_sent_ms;
+    bool setdns_ok;
+    char setdns_err[96];
 
     /* Event group (cross-task synchronization) */
     EventGroupHandle_t events;
