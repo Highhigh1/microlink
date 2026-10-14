@@ -30,6 +30,7 @@
 #include "psa/crypto.h"
 #include "esp_heap_caps.h"
 
+
 #ifdef CONFIG_ML_ZERO_COPY_WG
 #include "lwip/udp.h"
 #include "lwip/pbuf.h"
@@ -135,6 +136,17 @@ extern "C" {
 #define ML_NOISE_MAC_LEN        16
 #define ML_NOISE_NONCE_LEN      12
 #define ML_NOISE_HASH_LEN       32
+
+/* TOS byte for direct UDP (DISCO + WireGuard). Was 0xB8 (DSCP 46 -> WMM
+ * AC_VO), but frames in the voice queue from an ESP32-C6 over esp-hosted did
+ * not reach the other side on the same Wi-Fi, so the direct path never
+ * held and everything went through DERP. Best effort works. */
+#define ML_UDP_TOS 0
+
+/* IPv4 of every interface that is up (Wi-Fi, Ethernet...), host order.
+ * A board on two networks is reachable on both; only the default one used
+ * to be advertised. Returns how many were written. */
+int ml_local_ipv4s(uint32_t *out, int max);
 
 /* ============================================================================
  * Zero-Copy WG Types (Kconfig: CONFIG_ML_ZERO_COPY_WG)
@@ -282,6 +294,7 @@ typedef struct {
     uint64_t trust_until_ms;        /* Direct path trusted until */
     uint64_t last_send_ms;          /* Last data sent to this peer */
     uint64_t last_upgrade_ms;       /* Last path upgrade attempt */
+    uint64_t last_cmm_ms;           /* Last CallMeMaybe we sent */
 
     /* Best direct path */
     uint32_t best_ip;

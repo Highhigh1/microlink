@@ -177,6 +177,8 @@ struct wireguard_peer {
 	// last_tx and last_rx of data packets
 	uint32_t last_tx;
 	uint32_t last_rx;
+	// last_tx without keepalives: an idle peer never answers those
+	uint32_t last_data_tx;
 
 	// We set this flag on RX/TX of packets if we think that we should initiate a new handshake
 	bool send_handshake;

@@ -1427,12 +1427,12 @@ static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     cJSON *et_array = cJSON_AddArrayToObject(root, "EndpointTypes");
     if (!ep_array || !et_array) return 0;
 
-    /* LAN endpoint (WiFi STA) */
-    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta_netif) {
-        esp_netif_ip_info_t ip_info;
-        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            uint32_t local_ip = ntohl(ip_info.ip.addr);
+    /* LAN endpoints: every interface that is up (Wi-Fi, Ethernet) */
+    uint32_t lan_ips[2];
+    int lan_n = ml_local_ipv4s(lan_ips, 2);
+    for (int li = 0; li < lan_n; li++) {
+        {
+            uint32_t local_ip = lan_ips[li];
             char ep_str[32];
             snprintf(ep_str, sizeof(ep_str), "%lu.%lu.%lu.%lu:%u",
                      (unsigned long)((local_ip >> 24) & 0xFF),

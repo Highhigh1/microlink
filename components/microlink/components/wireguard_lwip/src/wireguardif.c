@@ -298,6 +298,9 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 					now = wireguard_sys_now();
 					peer->last_tx = now;
 					keypair->last_tx = now;
+					if (q) {
+						peer->last_data_tx = now;
+					}
 				}
 
 				pbuf_free(pbuf);
@@ -316,10 +319,13 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 		} else {
 			// key has expired...
 			keypair_destroy(keypair);
+			peer->send_handshake = true;
 			result = ERR_CONN;
 		}
 	} else {
-		// No valid keys!
+		// No valid keys: traffic waiting asks for a handshake (the periodic
+		// task sends it, at most once per REKEY_TIMEOUT)
+		peer->send_handshake = true;
 		result = ERR_CONN;
 	}
 	return result;
@@ -921,6 +927,12 @@ err_t wireguardif_connect(struct netif *netif, u8_t peer_index) {
 			peer->active = true;
 			peer->ip = peer->connect_ip;
 			peer->port = peer->connect_port;
+			// An initiation already in flight (e.g. via DERP a moment ago) would be
+			// replaced by a new one and its response dropped as "no peer found";
+			// let it finish, the session then uses the new endpoint.
+			if (!wireguardif_can_send_initiation(peer)) {
+				return ERR_OK;
+			}
 			// Force immediate handshake to the new endpoint
 			peer->send_handshake = true;
 			peer->last_initiation_tx = 0;
@@ -987,6 +999,24 @@ void wireguardif_shutdown(struct netif *netif) {
 	// Cancel the periodic timer BEFORE freeing any resources
 	// This prevents use-after-free in wireguardif_tmr callback
 	sys_untimeout(wireguardif_tmr, device);
+}
+
+// Send to another path (ip NULL = DERP) without a new handshake: the session
+// keys do not depend on the path, and the peer roams to wherever an
+// authenticated packet comes from.
+err_t wireguardif_set_path(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		if (ip) {
+			peer->ip = *ip;
+			peer->port = port;
+		} else {
+			ip_addr_set_any(false, &peer->ip);
+			peer->port = 0;
+		}
+	}
+	return result;
 }
 
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
@@ -1073,6 +1103,18 @@ static bool should_send_initiation(struct wireguard_peer *peer) {
 			result = true;
 		} else if (!peer->curr_keypair.valid && peer->active) {
 			result = true;
+		} else if (peer->curr_keypair.valid && (int32_t)(peer->last_data_tx - peer->last_rx) > 0) {
+			// Sent data but heard nothing for KEEPALIVE + REKEY_TIMEOUT: the peer lost
+			// the session (it restarted) and drops our packets. A server has
+			// nothing of its own to send, so only we can start over. Keepalives
+			// do not count: an idle peer does not answer them.
+			uint32_t heard = peer->last_rx;
+			if ((int32_t)(peer->curr_keypair.keypair_millis - heard) > 0) {
+				heard = peer->curr_keypair.keypair_millis;
+			}
+			if (wireguard_expired(heard, KEEPALIVE_TIMEOUT + REKEY_TIMEOUT)) {
+				result = true;
+			}
 		}
 	}
 	return result;
@@ -1154,10 +1196,10 @@ static void wireguardif_tmr(void *arg) {
 		}
 	}
 
-	if (!link_up) {
-		// Clear the IF-UP flag on netif
-		netif_set_link_down(device->netif);
-	}
+	(void)link_up;
+	// The link stays up with no session: a packet for a peer must reach
+	// wireguardif_output to ask for the handshake, and with the link down
+	// lwIP routes 100.x out of the default interface instead.
 }
 
 void wireguardif_periodic(struct netif *netif) {
@@ -1205,18 +1247,7 @@ void wireguardif_periodic(struct netif *netif) {
 			}
 		}
 	}
-	if (!link_up) {
-		// This runs on the caller's task, not the tcpip thread: take the core
-		// lock for the netif change unless this thread already holds it.
-#if LWIP_TCPIP_CORE_LOCKING
-		bool locked = !sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER);
-		if (locked) LOCK_TCPIP_CORE();
-		netif_set_link_down(device->netif);
-		if (locked) UNLOCK_TCPIP_CORE();
-#else
-		netif_set_link_down(device->netif);
-#endif
-	}
+	(void)link_up; /* see wireguardif_tmr */
 }
 
 err_t wireguardif_init(struct netif *netif) {

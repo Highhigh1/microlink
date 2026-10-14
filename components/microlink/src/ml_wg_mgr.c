@@ -293,8 +293,7 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
              * udp_bind — avoids registering for input which would steal WG
              * responses from the DISCO BSD socket. udp_sendto uses local_port. */
             s_wg_output_pcb->local_port = 51820;
-            /* DSCP 46 (EF) → WMM AC_VO for low-latency WiFi scheduling */
-            s_wg_output_pcb->tos = 0xB8;
+            s_wg_output_pcb->tos = ML_UDP_TOS;
         }
     }
     ml_lwip_unlock(_l);
@@ -958,9 +957,8 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                 wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
                                              &ep_ip, pkt->src_port);
 
-                /* Only call connect (forces handshake) if:
-                 * 1. Peer has an active WG session, AND
-                 * 2. The endpoint actually changed (avoid re-handshake on every heartbeat PONG) */
+                /* With an active WG session, move it to the new endpoint if it
+                 * changed (no handshake: the keys do not depend on the path) */
                 ip_addr_t cur_ip;
                 u16_t cur_port;
                 err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
@@ -970,7 +968,8 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                     uint32_t cur_ip_u32 = ip4_addr_get_u32(ip_2_ip4(&cur_ip));
                     uint32_t new_ip_u32 = htonl(pkt->src_ip);
                     if (cur_ip_u32 != new_ip_u32 || cur_port != pkt->src_port) {
-                        { bool _wl = ml_lwip_lock(); wireguardif_connect(netif, (u8_t)p->wg_peer_index); ml_lwip_unlock(_wl); }
+                        /* The session works on any path: move it, no new handshake */
+                        { bool _wl = ml_lwip_lock(); wireguardif_set_path(netif, (u8_t)p->wg_peer_index, &ep_ip, pkt->src_port); ml_lwip_unlock(_wl); }
                         ESP_LOGI(TAG, "WG endpoint SWITCHED to direct: %d.%d.%d.%d:%d for %s",
                                  (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                                  (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
@@ -1220,28 +1219,50 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
  * Reference: tailscale/wgengine/magicsock/magicsock.go (sendCallMeMaybe)
  * ========================================================================== */
 
+int ml_local_ipv4s(uint32_t *out, int max)
+{
+    int n = 0;
+    esp_netif_t *it = NULL;
+    while (n < max && (it = esp_netif_next_unsafe(it)) != NULL) {
+        esp_netif_ip_info_t ip;
+        if (!esp_netif_is_netif_up(it) || esp_netif_get_ip_info(it, &ip) != ESP_OK || ip.ip.addr == 0) {
+            continue;
+        }
+        uint32_t a = ntohl(ip.ip.addr);
+        if ((a >> 24) == 127) {
+            continue;
+        }
+        out[n++] = a;
+    }
+    return n;
+}
+
 static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     ml_peer_t *p = &ml->peers[peer_idx];
 
+    /* Two microlink peers answer each CallMeMaybe with their own: without a
+     * limit they bounce one every DERP round trip and flood the probe table. */
+    uint64_t now_ms = ml_get_time_ms();
+    if (p->last_cmm_ms && now_ms - p->last_cmm_ms < 5000) {
+        return;
+    }
+    p->last_cmm_ms = now_ms;
+
     /* Build plaintext: [type(1)][version(1)][endpoints(N * 18)] */
-    uint8_t plaintext[2 + 3 * 18];  /* Up to 3 endpoints */
+    uint8_t plaintext[2 + 4 * 18];  /* Up to 4 endpoints */
     int pt_len = 0;
     int ep_count = 0;
 
     plaintext[pt_len++] = DISCO_MSG_CALL_ME_MAYBE;
     plaintext[pt_len++] = 0;  /* version */
 
-    /* 1. Local LAN IP endpoint (critical for same-network peers). Use whatever
-     * interface currently carries the default route (WiFi or Ethernet) rather
-     * than assuming WIFI_STA_DEF, so same-LAN direct paths work on Ethernet too. */
-    esp_netif_t *netif = esp_netif_get_default_netif();
-    if (!netif) {
-        netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    }
-    if (netif) {
-        esp_netif_ip_info_t ip_info;
-        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            uint32_t local_ip = ntohl(ip_info.ip.addr);
+    /* 1. Local LAN IP endpoints (critical for same-network peers): every
+     * interface that is up, so a board on Ethernet and Wi-Fi is reachable on both. */
+    uint32_t lan_ips[2];
+    int lan_n = ml_local_ipv4s(lan_ips, 2);
+    for (int li = 0; li < lan_n; li++) {
+        {
+            uint32_t local_ip = lan_ips[li];
             uint16_t local_port = ml->disco_local_port;
 
             if (local_port > 0) {
@@ -1468,7 +1489,8 @@ static void disco_periodic_probes(microlink_t *ml) {
                     err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
                                                            NULL, NULL);
                     if (is_up == ERR_OK) {
-                        wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
+                        /* Keep the session, only send it through DERP */
+                        { bool _wl = ml_lwip_lock(); wireguardif_set_path(netif, (u8_t)p->wg_peer_index, NULL, 0); ml_lwip_unlock(_wl); }
                         ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
                     }
                 }
