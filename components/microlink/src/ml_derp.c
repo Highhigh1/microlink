@@ -362,8 +362,31 @@ static int poll_derp_read(microlink_t *ml) {
         return n;
     }
     if (n < 5) {
-        ESP_LOGW(TAG, "DERP partial header: got %d of 5 bytes", n);
-        return -1;
+        /* mbedtls_ssl_read returns at most what is left of the current TLS record,
+         * so a header that straddles two records arrives in two pieces. That is
+         * normal under load, not an error: finish reading it the same way the
+         * payload is read below. (Treating it as fatal tore the DERP connection
+         * down several times a minute while video and audio were relayed.) */
+        int got = n;
+        uint64_t hdr_start = ml_get_time_ms();
+        while (got < 5) {
+            if (ml_get_time_ms() - hdr_start > 5000) {
+                ESP_LOGW(TAG, "DERP header timeout at %d/5 bytes", got);
+                return -1;
+            }
+            n = mbedtls_ssl_read(&ml->derp.ssl, header + got, 5 - got);
+            if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
+                n == MBEDTLS_ERR_SSL_TIMEOUT) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            if (n <= 0) {
+                ESP_LOGW(TAG, "DERP header read error: %d (0x%04x) at %d/5 bytes",
+                         n, n < 0 ? -n : 0, got);
+                return n;
+            }
+            got += n;
+        }
     }
 
     uint8_t frame_type = header[0];
