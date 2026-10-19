@@ -57,7 +57,7 @@ extern "C" {
  * the real-time capture path. On this board core 1's other big tenant is the
  * H.264 encoder, idle in the default MJPEG mode. */
 #define ML_TASK_NET_IO_STACK    (8 * 1024)
-#define ML_TASK_NET_IO_PRIO     4
+#define ML_TASK_NET_IO_PRIO     6   /* see ML_TASK_DERP_TX_PRIO */
 #define ML_TASK_NET_IO_CORE     1
 
 #define ML_TASK_DERP_TX_STACK   (8 * 1024) /* peak 3.2 KB measured */
@@ -65,17 +65,27 @@ extern "C" {
  * pumps the whole tunnel, both ways. At 3 it sat under the board's video
  * sender (prio 4), which does the TLS and WireGuard encryption of each frame
  * in its own context and can keep this task off the CPU for a whole frame.
- * At 4 the two round-robin each tick; this task still stays under the
- * board's HTTPS server and encoder (prio 5). */
-#define ML_TASK_DERP_TX_PRIO    4
+ * 4 -> 6 (B-Box Lite, 2026-10-19, together with net_io and wg_mgr): the three
+ * tasks that move tunnel packets must outrank the board's application tasks
+ * (HTTPS server, talk, HID, encoder: all prio 5). Measured with a 1 ms core
+ * sampler while a phone on 5G ran video + talk over DERP: the HTTPS server
+ * (prio 5, unpinned) spent 200-400 ms per 2 s on TLS handshakes (iOS Safari
+ * opens a new connection every few hundred ms) and, whenever it landed on
+ * core 1, kept these tasks off the CPU for 100-300 ms at a stretch. The DERP
+ * task's reads stalled for exactly that long and the voice stream to the
+ * target machine had 110-130 ms gaps. lwIP's core lock was never held for more
+ * than 4 ms by anyone, so it was scheduling, not lock contention. At 6 the DERP
+ * task's longest wait fell from ~100 ms to 3 ms and the gaps went away; the
+ * three tasks together use about 25% of core 1, so nothing below them starves. */
+#define ML_TASK_DERP_TX_PRIO    6
 #define ML_TASK_DERP_TX_CORE    1
 
 #define ML_TASK_COORD_STACK     (12 * 1024)
-#define ML_TASK_COORD_PRIO      3
+#define ML_TASK_COORD_PRIO      3   /* control plane only: not on the packet path */
 #define ML_TASK_COORD_CORE      1
 
 #define ML_TASK_WG_MGR_STACK    (8 * 1024)
-#define ML_TASK_WG_MGR_PRIO     4
+#define ML_TASK_WG_MGR_PRIO     6   /* see ML_TASK_DERP_TX_PRIO */
 #define ML_TASK_WG_MGR_CORE     1
 
 /* Queue depths */
