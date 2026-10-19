@@ -46,12 +46,14 @@ extern "C" {
  * ========================================================================== */
 
 /* Task configuration.
- * Priorities are kept BELOW a co-hosted application's latency-critical tasks so
- * MicroLink cannot starve them. In ESP-KVM the HTTPS console runs at prio 6 and
- * the video capture task at prio 5; MicroLink's heaviest task must stay under
- * both or a TLS handshake (CPU-bound crypto) gets preempted long enough that the
- * browser times out. The relative order here is preserved: the RX-latency tasks
- * (net_io, wg_mgr) sit above the throughput tasks (derp_tx, coord). */
+ * Upstream kept every MicroLink task BELOW the co-hosted application's
+ * latency-critical tasks (in ESP-KVM the HTTPS console runs at prio 6 and the
+ * video capture task at prio 5) so a TLS handshake could not be preempted long
+ * enough for the browser to time out. B-Box Lite (2026-10-19) does the opposite
+ * for the three tasks that move tunnel packets (net_io, derp_tx, wg_mgr): they
+ * run ABOVE the application tasks, because the application's HTTPS server was
+ * starving them instead (see ML_TASK_DERP_TX_PRIO). Only coord, control plane,
+ * stays low. */
 /* All MicroLink tasks are pinned to core 1, leaving core 0 for the ESP-KVM video
  * capture/encode task (which runs there) so the tunnel cannot steal cycles from
  * the real-time capture path. On this board core 1's other big tenant is the
