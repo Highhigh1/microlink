@@ -61,7 +61,13 @@ extern "C" {
 #define ML_TASK_NET_IO_CORE     1
 
 #define ML_TASK_DERP_TX_STACK   (8 * 1024) /* peak 3.2 KB measured */
-#define ML_TASK_DERP_TX_PRIO    3
+/* 3 -> 4 (B-Box Lite, 2026-10-19): when the peer has no direct path, this task
+ * pumps the whole tunnel, both ways. At 3 it sat under the board's video
+ * sender (prio 4), which does the TLS and WireGuard encryption of each frame
+ * in its own context and can keep this task off the CPU for a whole frame.
+ * At 4 the two round-robin each tick; this task still stays under the
+ * board's HTTPS server and encoder (prio 5). */
+#define ML_TASK_DERP_TX_PRIO    4
 #define ML_TASK_DERP_TX_CORE    1
 
 #define ML_TASK_COORD_STACK     (12 * 1024)
@@ -73,7 +79,11 @@ extern "C" {
 #define ML_TASK_WG_MGR_CORE     1
 
 /* Queue depths */
-#define ML_DERP_TX_QUEUE_DEPTH  16
+/* When no direct path exists, all tunnel traffic (not just control) rides DERP,
+ * and the enqueue drops the oldest packet once the queue is full. Deep enough
+ * to hold a whole TCP send window (192 KB on the board's tailnet connections ≈
+ * 170 packets): a 1080p H.264 keyframe is ~200 KB and arrives as one burst. */
+#define ML_DERP_TX_QUEUE_DEPTH  256
 #define ML_DISCO_RX_QUEUE_DEPTH 16
 /* Deep enough to hold a TCP window's worth of packets while the manager task
  * is busy with a handshake or a DISCO probe round. The enqueue in
@@ -81,6 +91,10 @@ extern "C" {
  * bulk transfer lost enough packets to collapse TCP. Each slot holds a
  * pointer and a few fields, not the packet. */
 #define ML_WG_RX_QUEUE_DEPTH    64
+
+/* Inbound WireGuard packets dropped because wg_rx_queue was full (DERP and
+ * direct paths). Logged with the DERP status line in ml_derp.c. */
+extern volatile uint32_t ml_dbg_wg_rx_drops;
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400
