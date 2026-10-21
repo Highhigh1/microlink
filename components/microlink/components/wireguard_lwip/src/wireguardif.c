@@ -785,15 +785,14 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 					// Update the peer location
 					update_peer_addr(peer, addr, port);
 
-					// If initiation arrived via DERP (addr=0.0.0.0), send response
-					// via DERP too by temporarily clearing the peer endpoint.
-					// The ESP32 on cellular may not reach the peer's direct endpoint.
-					ip_addr_t saved_ip;
-					u16_t saved_port;
-					bool via_derp = ip_addr_isany(addr);
-					if (via_derp) {
-						saved_ip = peer->ip;
-						saved_port = peer->port;
+					// If initiation arrived via DERP (addr=0.0.0.0), the peer is
+					// using the relay: answer via DERP and keep the new session's
+					// data there too. Restoring the previous endpoint here sent data
+					// to an address the peer had left (e.g. a direct path from
+					// another network) while handshakes kept passing via DERP.
+					// A direct DISCO pong puts a working direct path back
+					// (ml_wg_mgr process_disco_pong -> wireguardif_set_path).
+					if (ip_addr_isany(addr)) {
 						ip_addr_set_any(false, &peer->ip);
 						peer->port = 0;
 						printf("[WG_RX] Sending response via DERP (initiation was relayed)\n");
@@ -801,12 +800,6 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 
 					// Send back a handshake response
 					wireguardif_send_handshake_response(device, peer);
-
-					// Restore peer endpoint after sending
-					if (via_derp) {
-						peer->ip = saved_ip;
-						peer->port = saved_port;
-					}
 				} else {
 					printf("[WG_RX] Initiation process FAILED (bad keys/timestamp?)\n");
 				}

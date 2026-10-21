@@ -383,6 +383,26 @@ static int find_peer_by_disco_key(microlink_t *ml, const uint8_t *disco_key) {
     return -1;
 }
 
+/* Forget the direct endpoint wireguard-lwip holds for this peer, session or
+ * not, whenever we stop trusting the direct path. Clearing only the current
+ * path is not enough: a WG peer reset copies connect_ip back into ip. Data then
+ * keeps going to an address that no longer answers while handshakes still
+ * succeed through DERP, until a reboot (seen when the peer moved to a network
+ * with no direct path). Data goes via DERP until a direct pong installs a new one. */
+static void forget_direct_endpoint(microlink_t *ml, ml_peer_t *p) {
+    if (!ml->wg_netif || p->wg_peer_index < 0) return;
+    struct netif *netif = (struct netif *)ml->wg_netif;
+    ip_addr_t none;
+    ip_addr_set_any(false, &none);
+    {
+        bool _wl = ml_lwip_lock();
+        wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index, &none, 0);
+        wireguardif_set_path(netif, (u8_t)p->wg_peer_index, NULL, 0);
+        ml_lwip_unlock(_wl);
+    }
+    ESP_LOGI(TAG, "  WG endpoint cleared, %s now via DERP", p->hostname);
+}
+
 static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Peer allowlist filter: don't waste WG slots on non-allowed peers.
      * Still process updates for existing peers (they may become allowed later). */
@@ -392,7 +412,8 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 
     /* Check if peer already exists */
     int idx = find_peer_by_key(ml, update->public_key);
-    if (idx >= 0) {
+    bool existing = idx >= 0;
+    if (existing) {
         ESP_LOGI(TAG, "Updating existing peer %s (idx=%d)", update->hostname, idx);
     } else {
         /* Find free slot */
@@ -466,12 +487,20 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Initialize DISCO rate limiting state */
     p->last_ping_sent_ms = 0;
     p->last_pong_recv_ms = 0;
-    p->trust_until_ms = 0;
     p->last_send_ms = 0;
     p->last_upgrade_ms = 0;
-    p->has_direct_path = false;
-    p->best_ip = 0;
-    p->best_port = 0;
+    /* An existing peer keeps its direct path: wireguardif_add_peer leaves an
+     * already registered WG peer as it is, endpoint included, so the DISCO
+     * state must keep describing it. Dropping it here left the WG endpoint
+     * with nothing to expire it, and a working direct path would also fall
+     * back to DERP on every map update. If the path is gone, the trust
+     * expiry in disco_periodic_probes clears both. */
+    if (!existing) {
+        p->trust_until_ms = 0;
+        p->has_direct_path = false;
+        p->best_ip = 0;
+        p->best_port = 0;
+    }
     p->wg_peer_index = -1;
 
     char ip_str[16];
@@ -1384,11 +1413,13 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
     wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
     ESP_LOGI(TAG, "WG handshake triggered (DERP) to %s", p->hostname);
 
-    /* Path 2: Direct UDP (if DISCO has a known endpoint).
+    /* Path 2: Direct UDP (if DISCO currently trusts a direct endpoint).
      * This wakes the peer's magicsock via receiveIPv4 → noteRecvActivity.
      * Set connect_ip first, then call wireguardif_connect which copies
-     * connect_ip → ip and starts a second handshake to the direct endpoint. */
-    if (p->best_ip != 0 && p->best_port != 0) {
+     * connect_ip → ip and starts a second handshake to the direct endpoint.
+     * best_ip outlives the trust window, so without has_direct_path this would
+     * put an expired endpoint back as the data path. */
+    if (p->has_direct_path && p->best_ip != 0 && p->best_port != 0) {
         ip_addr_t ep_ip;
         IP_SET_TYPE_VAL(ep_ip, IPADDR_TYPE_V4);
         ip4_addr_set_u32(ip_2_ip4(&ep_ip), htonl(p->best_ip));
@@ -1480,21 +1511,11 @@ static void disco_periodic_probes(microlink_t *ml) {
             ESP_LOGI(TAG, "Direct path to %s expired, reverting to DERP", p->hostname);
             p->has_direct_path = false;
 
-            /* Only do DERP fallback + re-probe for allowed peers.
+            forget_direct_endpoint(ml, p);
+
+            /* Only re-probe for allowed peers.
              * Non-allowed peers just get their state cleaned above. */
             if (peer_allowed) {
-                /* Re-initiate DERP handshake only if we have an active WG session. */
-                if (ml->wg_netif && p->wg_peer_index >= 0) {
-                    struct netif *netif = (struct netif *)ml->wg_netif;
-                    err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
-                                                           NULL, NULL);
-                    if (is_up == ERR_OK) {
-                        /* Keep the session, only send it through DERP */
-                        { bool _wl = ml_lwip_lock(); wireguardif_set_path(netif, (u8_t)p->wg_peer_index, NULL, 0); ml_lwip_unlock(_wl); }
-                        ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
-                    }
-                }
-
                 /* Force-ping to try re-establishing direct path (WiFi only) */
                 if (!ml_at_socket_is_ready()) {
                     disco_send_ping_to_peer(ml, i, true);
